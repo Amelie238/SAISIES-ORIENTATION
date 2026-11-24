@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Suivi des saisies en établissement</title>
+<!-- Fichier à placer dans le dépôt GitHub, à côté de grist-plugin-api.js -->
+<script src="./grist-plugin-api.js"></script>
+<style>
+  :root { --rose: #ff0055; --bg: #fbf9ff; --card: #fff; --text: #3d3a4f; --muted: #8b88a0; --border: #e6e1f2; --accent: #b9a7f0; --soft: #efeafd; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font-family: "Segoe UI", system-ui, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  h1 { font-size: 1.05rem; text-align: center; text-decoration: underline; margin: 4px 0 14px; }
+  .cache { display: none !important; }
+  .barre { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-bottom: 12px; }
+  .barre label { display: flex; flex-direction: column; font-size: .72rem; color: var(--muted); font-weight: 600; gap: 3px; }
+  select, input, button { font: inherit; font-size: .85rem; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--card); color: var(--text); }
+  select { min-width: 150px; max-width: 260px; }
+  input[type=search] { min-width: 230px; }
+  button { cursor: pointer; background: var(--soft); }
+  button:hover { border-color: var(--accent); }
+  #compteur { color: var(--muted); font-size: .8rem; align-self: center; }
+  .onglets { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .onglet { border-radius: 999px; padding: 7px 16px; }
+  .onglet.on { font-weight: 700; background: var(--soft); box-shadow: 0 0 0 2px var(--accent); }
+  .alerte { background: #fdf0d5; color: #9a6b12; border-radius: 10px; padding: 10px 12px; font-size: .82rem; margin-bottom: 10px; }
+  .vide { color: var(--muted); padding: 18px; text-align: center; }
+  .bloc { margin-bottom: 22px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .8rem; background: var(--card); }
+  th, td { border: 1px solid #d9d6e3; padding: 6px 8px; }
+  thead th { background: var(--rose); color: #fff; text-align: center; font-weight: 700; text-transform: uppercase; font-size: .74rem; border-color: #fff; }
+  thead th.pal { text-align: left; font-size: .82rem; vertical-align: bottom; }
+  thead th.pal small { display: block; font-weight: 400; text-transform: none; opacity: .9; margin-top: 3px; }
+  tbody tr:nth-child(even) td { background: #fcfbff; }
+  tbody tr:hover td { background: #f4f0ff; }
+  td.uai { font-family: Consolas, monospace; white-space: nowrap; }
+  td.pct { text-align: center; white-space: nowrap; min-width: 92px; }
+  td.pct small { display: block; color: var(--muted); font-size: .66rem; }
+  td.pct.approx { font-style: italic; }
+  tr.acad td { background: #ffe0ec !important; font-weight: 700; }
+  tr.total td { background: #e9e4f7 !important; font-weight: 700; border-top: 2px solid var(--accent); }
+  td.dept { padding-left: 24px; }
+  td.nb { text-align: center; }
+  details.diag { margin-top: 14px; font-size: .75rem; color: var(--muted); }
+  details.diag summary { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<h1>Suivi des saisies en établissement pour relances - Année <span id="annee"></span></h1>
+
+<div class="barre">
+  <label>Académie<select id="f_acad"></select></label>
+  <label>Département<select id="f_dept"></select></label>
+  <label>Secteur<select id="f_sect"></select></label>
+  <label>Palier<select id="f_palier"></select></label>
+  <label id="blocRech">Recherche<input id="recherche" type="search" placeholder="UAI, commune, établissement…"></label>
+  <button id="reset" type="button">Réinitialiser</button>
+  <button id="actualiser" type="button" title="Relire la table">↻ Actualiser</button>
+  <span id="compteur"></span>
+</div>
+
+<div class="onglets">
+  <button class="onglet on" id="tabSuivi" type="button">Suivi par établissement</button>
+  <button class="onglet" id="tabRecap" type="button">Récapitulatif académique et départemental</button>
+</div>
+
+<div id="alerte"></div>
+<div id="contenu"></div>
+<details class="diag"><summary>Colonnes utilisées</summary><ul id="diag"></ul></details>
+
+<script>
+/* ================== CONFIGURATION ================== */
+
+const TABLE_NOM = "BDD SAISIES ORIENTATION";   // nom de la table (l'identifiant Grist est retrouvé automatiquement)
+const ANNEE = "2025/2026";
+
+// Colonnes texte, détectées par libellé. Si l'une est mal détectée, renseignez "col" avec son libellé exact.
+const CHAMPS = [
+  { cle: "acad",    nom: "Académie",      col: null, motifs: ["academie"],      exclure: [] },
+  { cle: "dept",    nom: "Département",   col: null, motifs: ["departement"],   exclure: [] },
+  { cle: "sect",    nom: "Secteur",       col: null, motifs: ["secteur"],       exclure: [] },
+  { cle: "palier",  nom: "Palier",        col: null, motifs: ["palier"],        exclure: [] },
+  { cle: "commune", nom: "Commune",       col: null, motifs: ["commune"],       exclure: [] },
+  { cle: "sigle",   nom: "Sigle",         col: null, motifs: ["sigle"],         exclure: [] },
+  { cle: "etab",    nom: "Etablissement", col: null, motifs: ["etablissement"], exclure: ["uai", "sigle", "commune", "phase"] },
+  { cle: "uai",     nom: "UAI",           col: null, motifs: ["uai"],           exclure: [] }
+];
+
+// Les 4 indicateurs, dans l'ordre d'affichage.
+// phase + mots : mots-clés qui identifient la colonne « % » et ses colonnes « nombre » (Nb / Nombre).
+// colPct / colNum / colDen : libellé exact à forcer si la détection automatique se trompe (null = automatique).
+// base : "eleves" = dénominateur = nombre d'élèves ; ou la clé d'un autre indicateur (ex. "i1") pour calculer
+//        le % par rapport à son nombre (ex. avis provisoires / intentions).
+const INDICATEURS = [
+  { cle: "i1", phase: "provisoire", mots: ["intention"],    titre: "Demandes des familles", colPct: null, colNum: null, colDen: null, base: "eleves" },
+  { cle: "i2", phase: "provisoire", mots: ["avis"],         titre: "Décisions du CC",       colPct: null, colNum: null, colDen: null, base: "eleves" },
+  { cle: "i3", phase: "definitive", mots: ["choix"],        titre: "Demandes des familles", colPct: null, colNum: null, colDen: null, base: "eleves" },
+  { cle: "i4", phase: "definitive", mots: ["proposition"],  titre: "Décisions du CC",       colPct: null, colNum: null, colDen: null, base: "eleves" }
+];
+
+/* ================== OUTILS ================== */
+
+const $ = function (id) { return document.getElementById(id); };
+function norm(s) {
+  return String(s === null || s === undefined ? "" : s).normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/œ/g, "oe").replace(/[^a-z0-9]+/g, " ").trim();
+}
+function h(tag, cls, txt) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (txt !== undefined && txt !== null) e.textContent = txt;
+  return e;
+}
+function texte(v) {
+  if (v === null || v === undefined || v === false) return "";
+  if (Array.isArray(v)) return v.filter(function (x) { return x !== "L"; }).join(", ");
+  if (typeof v === "object") return "";
+  return String(v);
+}
+function nombre(v) {
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  if (typeof v !== "string") return null;
+  const n = parseFloat(v.replace(/[\s%]/g, "").replace(",", "."));
+  return isNaN(n) ? null : n;
+}
+function fmtPct(v) {
+  return v === null || v === undefined ? "—" : v.toLocaleString("fr-FR", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
+}
+function fmtNb(v) { return v.toLocaleString("fr-FR", { maximumFractionDigits: 0 }); }
+
+/* ================== LECTURE DE LA TABLE ================== */
+
+let lignes = [];
+let vueActive = "suivi";
+
+async function lireMeta(tableId) {
+  const res = await Promise.all([grist.docApi.fetchTable("_grist_Tables"), grist.docApi.fetchTable("_grist_Tables_column")]);
+  const T = res[0], C = res[1];
+  const tid = T.id[T.tableId.indexOf(tableId)];
+  const colIdParId = {};
+  C.id.forEach(function (id, i) { colIdParId[id] = C.colId[i]; });
+  const metas = [];
+  C.id.forEach(function (id, i) {
+    if (C.parentId[i] !== tid) return;
+    const colId = C.colId[i];
+    if (colId === "manualSort" || colId.indexOf("gristHelper_") === 0) return;
+    metas.push({ colId: colId, label: C.label[i] || colId, type: C.type[i] || "",
+                 visible: C.visibleCol && C.visibleCol[i] ? colIdParId[C.visibleCol[i]] : null });
+  });
+  return metas;
+}
+
+function parLibelle(metas, lib) {
+  const n = norm(lib);
+  return metas.find(function (m) { return norm(m.label) === n || norm(m.colId) === n; }) || null;
+}
+function trouverTexte(champ, metas) {
+  if (champ.col) return parLibelle(metas, champ.col);
+  const ok = function (m) { const n = norm(m.label); return !champ.exclure.some(function (x) { return n.indexOf(x) !== -1; }); };
+  for (const mo of champ.motifs) { const m = metas.find(function (m) { return norm(m.label) === mo || norm(m.colId) === mo; }); if (m) return m; }
+  for (const mo of champ.motifs) { const m = metas.find(function (m) { return ok(m) && norm(m.label).indexOf(mo) !== -1; }); if (m) return m; }
+  return null;
+}
+
+const estNb = function (m) { return /\b(nb|nombre|effectif|effectifs)\b/.test(norm(m.label)); };
+const typeNum = function (m) { return !m.type || /^(Int|Numeric|Any)/.test(m.type); };
+const sansPct = function (m) { return m.label.indexOf("%") === -1; };
+const contient = function (m, mots) { const n = norm(m.label); return mots.every(function (w) { return n.indexOf(w) !== -1; }); };
+
+// Détecte, pour chaque indicateur, la colonne « % », la colonne « nombre » et la colonne « nombre d'élèves ».
+function detecterIndicateurs(metas) {
+  const motsCles = [].concat.apply([], INDICATEURS.map(function (i) { return i.mots; }));
+  INDICATEURS.forEach(function (ind) {
+    const avecPhase = function (m) { return contient(m, [ind.phase].concat(ind.mots)); };
+    ind.pct = ind.colPct ? parLibelle(metas, ind.colPct)
+      : metas.find(function (m) { return !sansPct(m) && avecPhase(m); }) || null;
+
+    if (ind.colNum) ind.num = parLibelle(metas, ind.colNum);
+    else {
+      const cand = metas.filter(function (m) { return sansPct(m) && typeNum(m) && estNb(m) && avecPhase(m); });
+      ind.num = cand[0] || null;
+      if (!ind.num) {
+        const c2 = metas.filter(function (m) { return sansPct(m) && typeNum(m) && estNb(m) && contient(m, ind.mots); });
+        if (c2.length === 1) ind.num = c2[0];
+      }
+    }
+    if (ind.colDen) ind.den = parLibelle(metas, ind.colDen);
+    else {
+      const score = function (m) { const n = norm(m.label); return (n.indexOf(ind.phase) !== -1 ? 2 : 0) + (/total|effectif/.test(n) ? 1 : 0); };
+      const cand = metas.filter(function (m) {
+        const n = norm(m.label);
+        return sansPct(m) && typeNum(m) && estNb(m) && n.indexOf("eleve") !== -1 && !motsCles.some(function (w) { return n.indexOf(w) !== -1; });
+      }).sort(function (a, b) { return score(b) - score(a); });
+      ind.den = cand[0] || null;
+    }
+  });
+}
+
+async function charger() {
+  $("compteur").textContent = "Chargement…";
+  $("alerte").innerHTML = "";
+  $("diag").innerHTML = "";
+  $("contenu").innerHTML = "";
+  try {
+    const T = await grist.docApi.fetchTable("_grist_Tables");
+    const idx = T.tableId.findIndex(function (id) { return norm(id) === norm(TABLE_NOM); });
+    if (idx < 0) throw new Error("Table « " + TABLE_NOM + " » introuvable dans ce document.");
+    const tableId = T.tableId[idx];
+    const data = await grist.docApi.fetchTable(tableId);
+    const metas = await lireMeta(tableId);
+
+    const cols = {};
+    CHAMPS.forEach(function (ch) { cols[ch.cle] = trouverTexte(ch, metas); });
+    detecterIndicateurs(metas);
+
+    // Résolution des colonnes de type référence
+    const refs = {};
+    const aResoudre = [];
+    CHAMPS.forEach(function (ch) { if (cols[ch.cle]) aResoudre.push({ k: ch.cle, m: cols[ch.cle] }); });
+    INDICATEURS.forEach(function (i) { ["pct", "num", "den"].forEach(function (t) { if (i[t]) aResoudre.push({ k: i.cle + t, m: i[t] }); }); });
+    await Promise.all(aResoudre.map(async function (x) {
+      if (x.m.type.indexOf("Ref:") !== 0) return;
+      try {
+        const ref = await grist.docApi.fetchTable(x.m.type.slice(4));
+        const cible = x.m.visible && ref[x.m.visible] ? x.m.visible : null;
+        const d = {};
+        ref.id.forEach(function (id, i) { d[id] = cible ? ref[cible][i] : id; });
+        refs[x.k] = d;
+      } catch (e) { /* valeur brute */ }
+    }));
+    const val = function (k, m, i) {
+      if (!m || !data[m.colId]) return null;
+      const v = data[m.colId][i];
+      return refs[k] && refs[k][v] !== undefined ? refs[k][v] : v;
+    };
+
+    lignes = (data.id || []).map(function (_, i) {
+      const l = { pct: {}, num: {}, den: {} };
+      CHAMPS.forEach(function (ch) { l[ch.cle] = texte(val(ch.cle, cols[ch.cle], i)).trim(); });
+      INDICATEURS.forEach(function (ind) {
+        l.pct[ind.cle] = nombre(val(ind.cle + "pct", ind.pct, i));
+        l.num[ind.cle] = nombre(val(ind.cle + "num", ind.num, i));
+        l.den[ind.cle] = nombre(val(ind.cle + "den", ind.den, i));
+      });
+      l._txt = norm([l.uai, l.commune, l.sigle, l.etab].join(" "));
+      return l;
+    });
+
+    // Un « % » stocké en fraction (0 à 1) est ramené sur 100
+    INDICATEURS.forEach(function (ind) {
+      const vals = lignes.map(function (l) { return l.pct[ind.cle]; }).filter(function (v) { return v !== null; });
+      if (vals.length && Math.max.apply(null, vals) <= 1) lignes.forEach(function (l) { if (l.pct[ind.cle] !== null) l.pct[ind.cle] *= 100; });
+    });
+
+    // Diagnostic et alertes
+    CHAMPS.forEach(function (ch) { $("diag").appendChild(h("li", null, ch.nom + " ← " + (cols[ch.cle] ? cols[ch.cle].label : "NON TROUVÉE"))); });
+    const manque = [], approx = [];
+    INDICATEURS.forEach(function (ind) {
+      const nom = ind.phase.toUpperCase() + " – " + ind.titre;
+      $("diag").appendChild(h("li", null, nom + " : % ← " + (ind.pct ? ind.pct.label : "NON TROUVÉE") +
+        " | nombre ← " + (ind.num ? ind.num.label : "NON TROUVÉE") + " | élèves ← " + (ind.den ? ind.den.label : "NON TROUVÉE")));
+      if (!ind.pct) manque.push(nom);
+      if (!ind.num || (ind.base === "eleves" && !ind.den)) approx.push(nom);
+    });
+    if (manque.length) $("alerte").appendChild(h("div", "alerte", "Colonne « % » introuvable pour : " + manque.join(" ; ") + ". Renseignez son libellé exact dans INDICATEURS (champ colPct)."));
+    if (approx.length) $("alerte").appendChild(h("div", "alerte", "Colonnes de nombres introuvables pour : " + approx.join(" ; ") + ". Le récapitulatif utilise alors une moyenne simple des % (valeurs en italique, précédées de ≈). Renseignez colNum / colDen dans INDICATEURS pour un calcul exact."));
+
+    $("annee").textContent = ANNEE;
+    dessinerFiltres();
+    dessiner();
+  } catch (err) {
+    console.error(err);
+    $("compteur").textContent = "";
+    $("alerte").appendChild(h("div", "alerte", "Impossible de lire la table : " + (err && err.message ? err.message : err)));
+  }
+}
+
+/* ================== FILTRES ================== */
+
+const FILTRES = [["acad", "f_acad", "Toutes"], ["dept", "f_dept", "Tous"], ["sect", "f_sect", "Tous"], ["palier", "f_palier", "Tous"]];
+const sel = { acad: "", dept: "", sect: "", palier: "" };
+
+function passe(l, ignorer) {
+  return FILTRES.every(function (f) { return f[0] === ignorer || !sel[f[0]] || (l[f[0]] || "") === sel[f[0]]; });
+}
+
+// Chaque liste ne propose que les valeurs compatibles avec les trois autres filtres.
+function dessinerFiltres() {
+  FILTRES.forEach(function (f) {
+    const k = f[0], s = $(f[1]);
+    const vals = Array.from(new Set(lignes.filter(function (l) { return passe(l, k); }).map(function (l) { return l[k] || ""; })))
+      .sort(function (a, b) { return a.localeCompare(b, "fr", { numeric: true }); });
+    if (sel[k] && vals.indexOf(sel[k]) === -1) sel[k] = "";
+    s.innerHTML = "";
+    const o0 = h("option", null, f[2]); o0.value = ""; s.appendChild(o0);
+    vals.forEach(function (v) { const o = h("option", null, v || "Non renseigné"); o.value = v; s.appendChild(o); });
+    s.value = sel[k];
+  });
+}
+FILTRES.forEach(function (f) {
+  $(f[1]).addEventListener("change", function () { sel[f[0]] = this.value; dessinerFiltres(); dessiner(); });
+});
+$("reset").addEventListener("click", function () {
+  FILTRES.forEach(function (f) { sel[f[0]] = ""; });
+  $("recherche").value = "";
+  dessinerFiltres(); dessiner();
+});
+$("recherche").addEventListener("input", dessiner);
+$("actualiser").addEventListener("click", charger);
+$("tabSuivi").addEventListener("click", function () { changerVue("suivi"); });
+$("tabRecap").addEventListener("click", function () { changerVue("recap"); });
+function changerVue(v) {
+  vueActive = v;
+  $("tabSuivi").classList.toggle("on", v === "suivi");
+  $("tabRecap").classList.toggle("on", v === "recap");
+  $("blocRech").classList.toggle("cache", v === "recap");
+  dessiner();
+}
+
+/* ================== AFFICHAGE ================== */
+
+function parPalier(rows) {
+  const g = {};
+  rows.forEach(function (l) { const p = l.palier || "Palier non renseigné"; (g[p] = g[p] || []).push(l); });
+  return Object.keys(g).sort(function (a, b) { return a.localeCompare(b, "fr", { numeric: true }); }).map(function (p) { return [p, g[p]]; });
+}
+
+// En-tête commun : cellule du palier (colspan span) + deux phases + 4 sous-titres
+function enteteTable(t, palier, nbEtab, span) {
+  const th = t.createTHead();
+  const r1 = th.insertRow();
+  const c0 = h("th", "pal", palier);
+  c0.colSpan = span; c0.rowSpan = 2;
+  c0.appendChild(h("small", null, nbEtab + " établissement(s)"));
+  r1.appendChild(c0);
+  const p1 = h("th", null, "Phase provisoire"); p1.colSpan = 2; r1.appendChild(p1);
+  const p2 = h("th", null, "Phase définitive"); p2.colSpan = 2; r1.appendChild(p2);
+  const r2 = th.insertRow();
+  INDICATEURS.forEach(function (i) { r2.appendChild(h("th", null, i.titre)); });
+}
+
+function dessiner() {
+  const zone = $("contenu");
+  zone.innerHTML = "";
+  const q = norm($("recherche").value);
+  const filtrees = lignes.filter(function (l) { return passe(l, null); });
+  const vus = vueActive === "suivi" ? filtrees.filter(function (l) { return !q || l._txt.indexOf(q) !== -1; }) : filtrees;
+  $("compteur").textContent = vus.length + " / " + lignes.length + " ligne(s)";
+  if (!vus.length) { zone.appendChild(h("div", "vide", "Aucune ligne à afficher.")); return; }
+
+  parPalier(vus).forEach(function (pg) {
+    const bloc = h("div", "bloc");
+    bloc.appendChild(vueActive === "suivi" ? tableSuivi(pg[0], pg[1]) : tableRecap(pg[0], pg[1]));
+    zone.appendChild(bloc);
+  });
+}
+
+function tableSuivi(palier, rows) {
+  const t = h("table");
+  enteteTable(t, palier, rows.length, 4);
+  const tb = t.createTBody();
+  rows.slice().sort(function (a, b) { return a.uai.localeCompare(b.uai, "fr") || a.etab.localeCompare(b.etab, "fr"); }).forEach(function (l) {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = l.uai; tr.cells[0].className = "uai";
+    tr.insertCell().textContent = l.commune;
+    tr.insertCell().textContent = l.sigle;
+    tr.insertCell().textContent = l.etab;
+    INDICATEURS.forEach(function (i) { const td = tr.insertCell(); td.className = "pct"; td.textContent = fmtPct(l.pct[i.cle]); });
+  });
+  return t;
+}
+
+/* ---------- Récapitulatif : calcul à partir des nombres ---------- */
+
+function denDe(l, ind) { return ind.base === "eleves" ? l.den[ind.cle] : l.num[ind.base]; }
+
+// % = somme des nombres / somme des effectifs (pondéré). À défaut de nombres : moyenne simple des % (pond = false).
+function agreger(rows) {
+  const res = {};
+  INDICATEURS.forEach(function (ind) {
+    let sn = 0, sd = 0, ok = false, sp = 0, np = 0;
+    rows.forEach(function (l) {
+      const n = l.num[ind.cle], d = denDe(l, ind);
+      if (n !== null && d !== null && d > 0) { sn += n; sd += d; ok = true; }
+      const p = l.pct[ind.cle];
+      if (p !== null) { sp += p; np++; }
+    });
+    res[ind.cle] = ok ? { pct: sn / sd * 100, num: sn, den: sd, pond: true } : np ? { pct: sp / np, pond: false } : null;
+  });
+  return res;
+}
+
+function ligneRecap(tb, libelle, classe, rows, estDept) {
+  const tr = tb.insertRow();
+  if (classe) tr.className = classe;
+  const c = tr.insertCell(); c.textContent = libelle; if (estDept) c.className = "dept";
+  const n = tr.insertCell(); n.className = "nb"; n.textContent = rows.length;
+  const ag = agreger(rows);
+  INDICATEURS.forEach(function (ind) {
+    const td = tr.insertCell(); td.className = "pct";
+    const r = ag[ind.cle];
+    if (!r) { td.textContent = "—"; return; }
+    if (r.pond) {
+      td.textContent = fmtPct(r.pct);
+      td.appendChild(h("small", null, fmtNb(r.num) + " / " + fmtNb(r.den)));
+    } else {
+      td.classList.add("approx");
+      td.textContent = "≈ " + fmtPct(r.pct);
+      td.title = "Moyenne simple des % (colonnes de nombres non trouvées)";
+    }
+  });
+}
+
+function tableRecap(palier, rows) {
+  const t = h("table");
+  enteteTable(t, palier, rows.length, 2);
+  const tb = t.createTBody();
+  const acads = {};
+  rows.forEach(function (l) { const a = l.acad || "Académie non renseignée"; (acads[a] = acads[a] || []).push(l); });
+  const noms = Object.keys(acads).sort(function (a, b) { return a.localeCompare(b, "fr"); });
+  noms.forEach(function (a) {
+    ligneRecap(tb, "Académie " + a, "acad", acads[a], false);
+    const depts = {};
+    acads[a].forEach(function (l) { const d = l.dept || "Département non renseigné"; (depts[d] = depts[d] || []).push(l); });
+    Object.keys(depts).sort(function (x, y) { return x.localeCompare(y, "fr", { numeric: true }); })
+      .forEach(function (d) { ligneRecap(tb, d, "", depts[d], true); });
+  });
+  if (noms.length > 1) ligneRecap(tb, "ENSEMBLE", "total", rows, false);
+  return t;
+}
+
+/* ================== DÉMARRAGE ================== */
+
+if (typeof grist === "undefined") {
+  $("contenu").textContent = "Erreur : grist-plugin-api.js est introuvable. Vérifiez qu'il est bien dans le dépôt GitHub, à côté de index.html.";
+} else {
+  grist.ready({ requiredAccess: "full" });
+  charger();
+}
+</script>
+</body>
+</html>
